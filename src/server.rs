@@ -6,7 +6,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -47,6 +47,7 @@ impl Client {
 pub struct Server {
     listener: TcpListener,
     is_running: Arc<AtomicBool>,
+    client_threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
 
 impl Server {
@@ -54,9 +55,11 @@ impl Server {
     pub fn new(addr: &str) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         let is_running = Arc::new(AtomicBool::new(false));
+        let client_threads = Arc::new(Mutex::new(Vec::new()));
         Ok(Server {
             listener,
             is_running,
+            client_threads,
         })
     }
 
@@ -73,14 +76,18 @@ impl Server {
                 Ok((stream, addr)) => {
                     info!("New client connected: {}", addr);
 
-                    // Handle the client request
-                    let mut client = Client::new(stream);
-                    while self.is_running.load(Ordering::SeqCst) {
-                        if let Err(e) = client.handle() {
-                            error!("Error handling client: {}", e);
-                            break;
+                    let is_running = self.is_running.clone();
+                    let client_thread = thread::spawn(move || {
+                        let mut client = Client::new(stream);
+                        while is_running.load(Ordering::SeqCst) {
+                            if let Err(e) = client.handle() {
+                                error!("Error handling client: {}", e);
+                                break;
+                            }
                         }
-                    }
+                    });
+
+                    self.client_threads.lock().unwrap().push(client_thread);
                 }
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     // No incoming connections, sleep briefly to reduce CPU usage
@@ -96,11 +103,17 @@ impl Server {
         Ok(())
     }
 
-    /// Stops the server by setting the `is_running` flag to `false`
+    /// Stops the server by setting the is_running flag to false
     pub fn stop(&self) {
         if self.is_running.load(Ordering::SeqCst) {
             self.is_running.store(false, Ordering::SeqCst);
             info!("Shutdown signal sent.");
+
+            // Wait for all client threads to finish
+            let mut client_threads = self.client_threads.lock().unwrap();
+            for handle in client_threads.drain(..) {
+                handle.join().expect("Failed to join client thread");
+            }
         } else {
             warn!("Server was already stopped or not running.");
         }
